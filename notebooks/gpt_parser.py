@@ -2,16 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-Overpayment Letter Parsing — Azure GPT-4.1 with robust BEGIN/END TABLE chunking.
+Overpayment Letter Parsing — Azure GPT-4.1 with numbered BEGIN/END TABLE chunking.
 
-- Processes ONLY processing_log rows where parsed_status == "pending"
-  AND a matching OCR .txt exists (basename match to CSV `filename`).
-- Splits each letter into chunks: one per table, bounded by "BEGIN TABLE" ... "END TABLE".
-  * [CONTEXT]       narrative text with ALL tables removed (intro + between-table boilerplate)
-  * [CURRENT_TABLE] exactly ONE table's rows (BEGIN/END lines removed)
-- If a table is very large, we split it by size to avoid output caps.
-- If NO tables exist, the whole letter is treated as CURRENT_TABLE (split by size if needed).
-- On success: set parsed_status="parsed". If any chunk fails or time budget exceeded: "failed".
+Markers (case-insensitive, whitespace-tolerant):
+    === BEGIN_TABLE: {tablenumber} ===
+    === END_TABLE:   {tablenumber} ===
+
+We:
+- Process ONLY rows in processing_log.csv where parsed_status == "pending" AND a matching .txt exists.
+- Split each letter into chunks: one per table (BEGIN/END numbers paired).
+- Each chunk sent to GPT has:
+    [CONTEXT]       narrative text with ALL tables removed
+    [CURRENT_TABLE] exactly one table's rows (BEGIN/END lines removed)
+- Very large tables are size-split to avoid output caps.
+- If NO tables exist, the entire letter is treated as CURRENT_TABLE (split by size if needed).
+- On success: parsed_status="parsed"; otherwise "failed".
 """
 
 import csv
@@ -19,8 +24,9 @@ import json
 import os
 import re
 import time
+import unicodedata
 from pathlib import Path
-from typing import List, Tuple, Iterable, Optional
+from typing import List, Tuple, Iterable, Optional, Dict
 from openai import AzureOpenAI
 
 # ======================
@@ -62,18 +68,18 @@ OUTPUT_FIELDS = [
     "payor",     # derived from ocr_output/<PAYOR>/...
 ]
 
-# ===== Table sentinel configuration =====
-# EXACT sentinels are "BEGIN TABLE" and "END TABLE" (case-insensitive).
-START_PAT = re.compile(r"(?im)^\s*BEGIN\s+TABLE\s*$")
-END_PAT   = re.compile(r"(?im)^\s*END\s+TABLE\s*$")
+# ===== Numbered table sentinels =====
+# Example: "=== BEGIN_TABLE: 6 ===" and "=== END_TABLE: 6 ==="
+BEGIN_RE = re.compile(r"""(?im)^[ \t]*=+\s*BEGIN_TABLE\s*:\s*(\d+)\s*=+[ \t]*$""")
+END_RE   = re.compile(r"""(?im)^[ \t]*=+\s*END_TABLE\s*:\s*(\d+)\s*=+[ \t]*$""")
 
 # Size limits (~4 chars/token; 12k chars ≈ 3k tokens)
 MAX_CHARS_PER_CHUNK = 12000
 CHUNK_OVERLAP_CHARS = 800
 
-# ===== Debugging aid =====
+# Debug
 DEBUG_DUMP_CHUNKS = False
-DEBUG_DIR = Path("debug_chunks")  # will contain <pdfname>__chunkNN.txt
+DEBUG_DIR = Path("debug_chunks")
 
 # ======================
 # Azure OpenAI (hard-code for now)
@@ -83,7 +89,7 @@ AZURE_OPENAI_API_KEY = "YOUR_KEY_HERE"
 AZURE_OPENAI_API_VERSION = "2024-10-21"
 AZURE_OPENAI_DEPLOYMENT = "gpt-4.1-overpayment"
 TEMPERATURE = 0.0
-MAX_OUTPUT_TOKENS = 4000  # request near-maximum per response
+MAX_OUTPUT_TOKENS = 4000
 
 def make_client() -> AzureOpenAI:
     return AzureOpenAI(
@@ -93,8 +99,14 @@ def make_client() -> AzureOpenAI:
     )
 
 # ======================
-# Small helpers
+# Helpers
 # ======================
+def normalize_text(s: str) -> str:
+    """Normalize Unicode, fix NBSP, unify newlines."""
+    s = unicodedata.normalize("NFKC", s).replace("\u00A0", " ")
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    return s
+
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
@@ -157,45 +169,41 @@ def call_gpt_with_retries(client: AzureOpenAI, system_msg: str, user_text: str) 
     raise last_err if last_err else RuntimeError("Unknown GPT error")
 
 # ======================
-# Table detection & chunking
+# Numbered BEGIN/END pairing + chunking
 # ======================
-def _line_indices(pattern: re.Pattern, text: str) -> List[int]:
-    return [m.start() for m in pattern.finditer(text)]
-
-def _strip_lines(pattern: re.Pattern, text: str) -> str:
-    """Remove all lines that match a pattern (to strip BEGIN/END markers)."""
-    keep = []
-    for line in text.splitlines(keepends=True):
-        if not pattern.match(line):
-            keep.append(line)
-    return "".join(keep)
-
-def locate_table_blocks(text: str) -> List[Tuple[int, int]]:
+def locate_numbered_blocks(text: str) -> List[Tuple[int, int, int]]:
     """
-    Return [(start,end)] for each table: from BEGIN TABLE line to END TABLE line.
-    If a BEGIN has no END after it, we terminate at EOF.
-    If an END appears before any BEGIN (weird OCR), we ignore it.
+    Find tables as (start_index, end_index, table_number).
+    Pairs BEGIN_TABLE:n with the next END_TABLE:n.
+    If END for a BEGIN is missing, use EOF as end.
     """
-    starts = _line_indices(START_PAT, text)
-    ends = _line_indices(END_PAT, text)
-    if not starts:
+    begins = [(m.start(), int(m.group(1))) for m in BEGIN_RE.finditer(text)]
+    ends   = [(m.start(), int(m.group(1))) for m in END_RE.finditer(text)]
+    if not begins:
         return []
 
-    blocks: List[Tuple[int, int]] = []
-    e_idx = 0
-    for s in starts:
-        # advance e_idx to the first END >= s
-        while e_idx < len(ends) and ends[e_idx] < s:
-            e_idx += 1
-        if e_idx < len(ends):
-            e = ends[e_idx]
-            e_idx += 1
-        else:
-            e = len(text)
-        blocks.append((s, e))
+    # Build dict of end positions by number, in order
+    ends_by_num: Dict[int, List[int]] = {}
+    for pos, num in ends:
+        ends_by_num.setdefault(num, []).append(pos)
+
+    blocks: List[Tuple[int, int, int]] = []
+    for bpos, num in begins:
+        epos = None
+        lst = ends_by_num.get(num, [])
+        # find the first END pos after this BEGIN
+        while lst:
+            candidate = lst.pop(0)
+            if candidate > bpos:
+                epos = candidate
+                break
+        blocks.append((bpos, epos if epos is not None else len(text), num))
+
+    # Ensure ascending by start pos (OCR may reorder)
+    blocks.sort(key=lambda t: t[0])
     return blocks
 
-def strip_blocks(text: str, blocks: List[Tuple[int, int]], end_limit: Optional[int] = None) -> str:
+def strip_blocks(text: str, blocks: List[Tuple[int, int, int]], end_limit: Optional[int] = None) -> str:
     """
     Remove all table blocks from text (optionally up to end_limit).
     Produces narrative-only text for [CONTEXT].
@@ -203,15 +211,24 @@ def strip_blocks(text: str, blocks: List[Tuple[int, int]], end_limit: Optional[i
     out = []
     pos = 0
     limit = len(text) if end_limit is None else min(end_limit, len(text))
-    for s, e in blocks:
+    for s, e, _n in blocks:
         if s >= limit:
             break
         if pos < s:
-            out.append(text[pos:s])   # keep narrative before table
-        pos = max(pos, min(e, limit)) # skip table region
+            out.append(text[pos:s])
+        pos = max(pos, min(e, limit))
     if pos < limit:
         out.append(text[pos:limit])
     return "".join(out)
+
+def _strip_marker_lines(text: str) -> str:
+    """Remove BEGIN/END lines entirely from a slice."""
+    lines = []
+    for ln in text.splitlines(keepends=True):
+        if BEGIN_RE.match(ln) or END_RE.match(ln):
+            continue
+        lines.append(ln)
+    return "".join(lines)
 
 def split_range_by_size(start: int, end: int) -> List[Tuple[int, int]]:
     ranges: List[Tuple[int, int]] = []
@@ -229,10 +246,10 @@ def build_chunks(text: str) -> List[str]:
     """
     Build chunks with:
       [CONTEXT]       -> narrative only, all tables removed
-      [CURRENT_TABLE] -> exactly one table (BEGIN/END stripped), size-split if necessary
+      [CURRENT_TABLE] -> exactly one table (markers removed), size-split if necessary
     If no tables -> entire text promoted to CURRENT_TABLE (may be size-split).
     """
-    blocks = locate_table_blocks(text)
+    blocks = locate_numbered_blocks(text)
 
     # No tables: promote whole letter into CURRENT_TABLE
     if not blocks:
@@ -241,26 +258,21 @@ def build_chunks(text: str) -> List[str]:
 
     chunks: List[str] = []
 
-    for i, (s, e) in enumerate(blocks):
+    for i, (s, e, num) in enumerate(blocks):
         next_start = blocks[i+1][0] if i + 1 < len(blocks) else len(text)
 
-        # CONTEXT = narrative text before this table (tables removed) + narrative after table up to next table
-        pre_context = strip_blocks(text, blocks, end_limit=s)
-        after_context = text[e:next_start]  # by construction contains no complete tables
-        context = (pre_context + "\n" + after_context).strip()
+        # ==== CHANGED: context is ONLY narrative up to this table, with all tables stripped ====
+        # Context = narrative ONLY up to the start of this table (all tables removed),
+        # nothing after this table.
+        context = strip_blocks(text, blocks, end_limit=s).strip()
 
-        # Table content slice; remove BEGIN/END marker lines
-        table_slice = text[s:e]
-        table_slice = _strip_lines(START_PAT, table_slice)
-        table_slice = _strip_lines(END_PAT, table_slice)
+        # table content without marker lines
+        table_slice = _strip_marker_lines(text[s:e])
 
-        # Split large table slices
+        # Split large tables
         if (e - s) > MAX_CHARS_PER_CHUNK:
-            ranges = split_range_by_size(s, e)
-            for rs, re_ in ranges:
-                part = text[rs:re_]
-                part = _strip_lines(START_PAT, part)
-                part = _strip_lines(END_PAT, part)
+            for rs, re_ in split_range_by_size(s, e):
+                part = _strip_marker_lines(text[rs:re_])
                 chunks.append(f"[CONTEXT]\n{context}\n\n[CURRENT_TABLE]\n{part}\n\n[END]")
         else:
             chunks.append(f"[CONTEXT]\n{context}\n\n[CURRENT_TABLE]\n{table_slice}\n\n[END]")
@@ -286,7 +298,7 @@ def main():
     # Map of OCR .txt files by basename (case-insensitive)
     txt_files = {p.stem.lower(): p for p in OCR_OUTPUT_DIR.rglob("*.txt")}
 
-    # Build worklist
+    # Worklist
     work_indices = []
     for i, r in enumerate(log_rows):
         if str(r.get(LOG_STATUS_COL, "")).strip().lower() != STATUS_PENDING:
@@ -325,7 +337,9 @@ def main():
         payor = derive_payor(OCR_OUTPUT_DIR, txt_path)
 
         try:
-            ocr_text = read_text(txt_path)
+            ocr_raw = read_text(txt_path)
+            ocr_text = normalize_text(ocr_raw)
+
             parts = build_chunks(ocr_text)
             print(f"[chunking] {row[LOG_FILENAME_COL]} -> {len(parts)} chunk(s)")
 
