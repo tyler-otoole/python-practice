@@ -1,17 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Overpayment Letter Parsing — GPT-4.1 pass on OCR text files (Azure OpenAI)
+- Processes ONLY processing_log.csv rows with parsed_status == "pending"
+  AND where ocr_output/**/basename.txt exists (case-insensitive basename match).
+- Splits each document into context-aware table chunks:
+    [CONTEXT] ... (all narrative, with ALL other tables removed)
+    [CURRENT_TABLE] ... (exactly one table block, or a slice of it if very large)
+- No-table fallback: if a letter has no tables, the entire letter is promoted to CURRENT_TABLE.
+- Calls Azure GPT-4.1 per chunk; appends JSONL rows to data/parsed_results.csv.
+- Marks file "parsed" only if ALL chunks succeed; otherwise "failed".
+- Run controls: MAX_FILES, MAX_MINUTES, MAX_RETRIES.
+
+Adjust the Azure constants below if you're hard-coding.
+"""
+
 import csv
 import json
 import os
 import re
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Iterable
 from openai import AzureOpenAI
 
 # ======================
-# Config — adjust freely
+# Paths / Config
 # ======================
 OCR_OUTPUT_DIR = Path("ocr_output")
 SYSTEM_MESSAGE_FILE = Path("prompts/system_message.txt")
@@ -45,34 +60,29 @@ OUTPUT_FIELDS = [
     "remit_due_date",
     "parsing_notes",
     "no_records",
-    "filename",   # original PDF name from log
+    "filename",   # original PDF name from processing log
     "payor",      # derived from OCR_OUTPUT_DIR/<PAYOR>/...
 ]
 
 # ======================
 # Chunking controls
 # ======================
-# Try to split on likely patient boundaries first (case-insensitive, ^ = start of line).
-PATIENT_SEPARATORS_PATTERN = re.compile(
-    r"(?im)^(?:\s*(?:patient(?:\s+name)?|account\s*id|claim\s*id)\b.*)$"
-)
+# Primary sentinel(s) from your OCR pipeline. You said "BEING_TABLE"; include "BEGIN_TABLE" defensively.
+TABLE_SENTINEL_PATTERN = re.compile(r"(?im)^\s*(?:BEING_TABLE|BEGIN_TABLE)\b.*$")
 
-# How many detected records (separators) to bundle per chunk when using the regex strategy
-SEP_GROUP_SIZE = 30
-
-# If we can't find separators, fall back to size-based chunking:
-MAX_CHARS_PER_CHUNK = 12000   # ~3k tokens (rule of thumb: ~4 chars/token)
-CHUNK_OVERLAP_CHARS = 1000    # small overlap to reduce boundary issues
+# Size limits (fallback or giant tables). Roughly ~4 chars/token; 12k chars ~3k tokens.
+MAX_CHARS_PER_CHUNK = 12000
+CHUNK_OVERLAP_CHARS = 800
 
 # ======================
-# Azure OpenAI (hard-coded for now)
+# Azure OpenAI (hard-code or swap to env/ dotenv later)
 # ======================
 AZURE_OPENAI_ENDPOINT = "https://my-overpayment-parser.openai.azure.com/"
 AZURE_OPENAI_API_KEY = "YOUR_KEY_HERE"
 AZURE_OPENAI_API_VERSION = "2024-10-21"
 AZURE_OPENAI_DEPLOYMENT = "gpt-4.1-overpayment"
 TEMPERATURE = 0.0
-MAX_OUTPUT_TOKENS = 4000  # request a high cap per chunk
+MAX_OUTPUT_TOKENS = 4000  # request near-maximum per response
 
 def make_client() -> AzureOpenAI:
     return AzureOpenAI(
@@ -82,7 +92,7 @@ def make_client() -> AzureOpenAI:
     )
 
 # ======================
-# Helpers
+# Small helpers
 # ======================
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
@@ -98,8 +108,8 @@ def derive_payor(ocr_root: Path, file_path: Path) -> str:
     except Exception:
         return ""
 
-def sanitize_jsonl(raw: str):
-    """Keep only lines that look like JSON objects; strip code fences/trailing commas."""
+def sanitize_jsonl(raw: str) -> Iterable[str]:
+    """Keep only lines that look like JSON objects; strip code fences / trailing commas."""
     for line in raw.splitlines():
         s = line.strip().strip("`").strip()
         if not s:
@@ -109,7 +119,7 @@ def sanitize_jsonl(raw: str):
         if s.startswith("{") and s.endswith("}"):
             yield s
 
-def append_rows(rows, csv_path: Path):
+def append_rows(rows: List[dict], csv_path: Path):
     if not rows:
         return
     csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,6 +130,9 @@ def append_rows(rows, csv_path: Path):
             w.writeheader()
         w.writerows(rows)
 
+# ======================
+# GPT call
+# ======================
 def call_gpt(client: AzureOpenAI, system_msg: str, user_text: str) -> str:
     resp = client.chat.completions.create(
         model=AZURE_OPENAI_DEPLOYMENT,
@@ -133,7 +146,6 @@ def call_gpt(client: AzureOpenAI, system_msg: str, user_text: str) -> str:
     return resp.choices[0].message.content or ""
 
 def call_gpt_with_retries(client: AzureOpenAI, system_msg: str, user_text: str) -> str:
-    """Linear backoff retries honoring MAX_RETRIES."""
     last_err = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -142,78 +154,111 @@ def call_gpt_with_retries(client: AzureOpenAI, system_msg: str, user_text: str) 
             last_err = e
             print(f"[retry {attempt}/{MAX_RETRIES}] GPT call failed: {e}")
             if attempt < MAX_RETRIES:
-                time.sleep(2 * attempt)
+                time.sleep(2 * attempt)  # simple backoff
     raise last_err if last_err else RuntimeError("Unknown GPT error")
 
-# ----------------------
-# Chunking implementations
-# ----------------------
-def find_separator_indices(text: str) -> List[int]:
-    """Return starting indices of lines that look like patient boundaries."""
-    return [m.start() for m in PATIENT_SEPARATORS_PATTERN.finditer(text)]
-
-def chunks_by_separators(text: str) -> List[Tuple[int, int]]:
+# ======================
+# Chunk building (context + single table)
+# ======================
+def locate_table_blocks(text: str) -> List[Tuple[int, int]]:
     """
-    Build chunks using detected patient boundaries.
-    Returns list of (start, end) index tuples covering entire text.
-    Groups SEP_GROUP_SIZE records per chunk; also bounds by MAX_CHARS_PER_CHUNK.
+    Return list of (start_idx, end_idx) for each table block.
+    A table starts at a TABLE_SENTINEL line and ends at the next sentinel or EOF.
     """
-    n = len(text)
-    idxs = find_separator_indices(text)
-    if len(idxs) < 2:
-        return []  # signal caller to fall back to size-based
+    starts = [m.start() for m in TABLE_SENTINEL_PATTERN.finditer(text)]
+    if not starts:
+        return []
+    blocks: List[Tuple[int, int]] = []
+    for i, s in enumerate(starts):
+        e = starts[i+1] if i+1 < len(starts) else len(text)
+        blocks.append((s, e))
+    return blocks
 
-    # Always include 0 as a start if the first patient doesn't start at 0
-    if idxs[0] != 0:
-        idxs = [0] + idxs
+def strip_blocks(text: str, blocks: List[Tuple[int, int]], up_to: int = None, after: Tuple[int, int] = None) -> str:
+    """
+    Remove specified table blocks from a slice of text.
+    - If up_to is set, keep only text from [0:up_to], then strip any table blocks fully within that slice.
+    - If after is set to (s,e), you can pass a slice after that block (e:next_start) and strip tables within it.
+    """
+    if up_to is not None:
+        slice_text = text[:up_to]
+        slice_blocks = [(s, e) for (s, e) in blocks if e <= up_to]
+    elif after is not None:
+        s0, e0 = after
+        # determine next start to bound the slice
+        # caller is expected to slice text[e0:next_start]
+        slice_text = text
+        slice_blocks = []  # we assume caller pre-sliced to not include complete tables
+    else:
+        slice_text = text
+        slice_blocks = blocks
 
+    if not slice_blocks:
+        return slice_text
+
+    out = []
+    pos = 0
+    for s, e in slice_blocks:
+        if pos < s:
+            out.append(slice_text[pos:s])
+        pos = e
+    if pos < len(slice_text):
+        out.append(slice_text[pos:])
+    return "".join(out)
+
+def split_block_by_size(text: str, start: int, end: int) -> List[Tuple[int, int]]:
+    """Split a big block [start:end] into size-bounded windows with overlap."""
     ranges: List[Tuple[int, int]] = []
-    i = 0
-    while i < len(idxs):
-        # Propose a chunk that spans SEP_GROUP_SIZE records
-        j = min(i + SEP_GROUP_SIZE, len(idxs))
-        start = idxs[i]
-        end = idxs[j] if j < len(idxs) else n
-
-        # If the proposed chunk exceeds MAX_CHARS_PER_CHUNK, split it further by size
-        if end - start > MAX_CHARS_PER_CHUNK:
-            ranges.extend(chunks_by_size(text[start:end], base_offset=start))
-        else:
-            ranges.append((start, end))
-        i = j
-    return coalesce_with_overlap(text, ranges, CHUNK_OVERLAP_CHARS)
-
-def chunks_by_size(text: str, base_offset: int = 0) -> List[Tuple[int, int]]:
-    """Fallback: fixed-size windows with overlap."""
-    n = len(text)
-    ranges: List[Tuple[int, int]] = []
-    start = 0
-    while start < n:
-        end = min(start + MAX_CHARS_PER_CHUNK, n)
-        ranges.append((base_offset + start, base_offset + end))
-        if end >= n:
+    n = end - start
+    offset = 0
+    while offset < n:
+        e = min(offset + MAX_CHARS_PER_CHUNK, n)
+        ranges.append((start + offset, start + e))
+        if e >= n:
             break
-        start = end - CHUNK_OVERLAP_CHARS if end - CHUNK_OVERLAP_CHARS > start else end
+        offset = max(offset, e - CHUNK_OVERLAP_CHARS)
     return ranges
 
-def coalesce_with_overlap(text: str, ranges: List[Tuple[int, int]], overlap: int) -> List[Tuple[int, int]]:
-    """Ensure adjacent ranges have at least `overlap` characters of overlap."""
-    if not ranges:
-        return ranges
-    coalesced = [ranges[0]]
-    for s, e in ranges[1:]:
-        ps, pe = coalesced[-1]
-        if s - pe < overlap:
-            s = max(ps, pe - overlap)
-        coalesced.append((s, e))
-    return coalesced
+def build_contextual_chunks(text: str) -> List[str]:
+    """
+    Yield chunks with:
+      [CONTEXT]    -> narrative only (all other tables removed)
+      [CURRENT_TABLE] -> exactly one table (or a size-slice of it)
+    No-table fallback: the entire letter goes to CURRENT_TABLE (may also be split by size).
+    """
+    blocks = locate_table_blocks(text)
 
-def build_chunks(text: str) -> List[str]:
-    """Return list of text chunks using separator strategy, falling back to size-based."""
-    ranges = chunks_by_separators(text)
-    if not ranges:
-        ranges = chunks_by_size(text)
-    return [text[s:e] for (s, e) in ranges]
+    # No tables: promote whole letter to CURRENT_TABLE (split by size if needed)
+    if not blocks:
+        # size-split the entire letter if necessary
+        whole_ranges = split_block_by_size(text, 0, len(text)) if len(text) > MAX_CHARS_PER_CHUNK else [(0, len(text))]
+        chunks: List[str] = []
+        for s, e in whole_ranges:
+            chunk = f"[CONTEXT]\n\n[CURRENT_TABLE]\n{text[s:e]}\n\n[END]"
+            chunks.append(chunk)
+        return chunks
+
+    chunks: List[str] = []
+
+    for idx, (s, e) in enumerate(blocks):
+        # CONTEXT for this table = (0 -> s) with all earlier tables stripped,
+        # plus after-table narrative (e -> next_start) with tables stripped (none fully in that slice).
+        pre_context = strip_blocks(text, blocks, up_to=s)
+        next_start = blocks[idx + 1][0] if (idx + 1) < len(blocks) else len(text)
+        after_slice = text[e:next_start]
+        # after_slice shouldn't contain full tables by construction, so no need to strip again
+        context = (pre_context + "\n" + after_slice).strip()
+
+        # CURRENT_TABLE = this table block (may need size-splitting)
+        table_ranges = [(s, e)]
+        if (e - s) > MAX_CHARS_PER_CHUNK:
+            table_ranges = split_block_by_size(text, s, e)
+
+        for ts, te in table_ranges:
+            chunk = f"[CONTEXT]\n{context}\n\n[CURRENT_TABLE]\n{text[ts:te]}\n\n[END]"
+            chunks.append(chunk)
+
+    return chunks
 
 # ======================
 # Main
@@ -275,15 +320,14 @@ def main():
 
         try:
             ocr_text = read_text(txt_path)
-            parts = build_chunks(ocr_text)
+            parts = build_contextual_chunks(ocr_text)
             if len(parts) > 1:
-                print(f"[chunking] {row[LOG_FILENAME_COL]} -> {len(parts)} chunks")
+                print(f"[chunking] {row[LOG_FILENAME_COL]} -> {len(parts)} chunk(s)")
 
             file_failed = False
             file_rows = 0
 
             for part_idx, part in enumerate(parts, 1):
-                # Time budget check before each chunk
                 if MAX_MINUTES is not None and (time.time() - start) > MAX_MINUTES * 60:
                     print(f"Reached MAX_MINUTES={MAX_MINUTES}, stopping early mid-file.")
                     file_failed = True
@@ -291,14 +335,14 @@ def main():
 
                 try:
                     raw = call_gpt_with_retries(client, system_msg, part)
-                    out_rows = []
+                    out_rows: List[dict] = []
                     for jline in sanitize_jsonl(raw):
                         try:
                             obj = json.loads(jline)
                         except json.JSONDecodeError:
                             continue
                         rec = {k: obj.get(k, None) for k in OUTPUT_FIELDS if k not in ("filename", "payor")}
-                        rec["filename"] = row[LOG_FILENAME_COL]
+                        rec["filename"] = row[LOG_FILENAME_COL]  # original PDF name from log
                         rec["payor"] = payor
                         out_rows.append(rec)
 
