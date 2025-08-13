@@ -2,18 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-Overpayment Letter Parsing — GPT-4.1 pass on OCR text files (Azure OpenAI)
-- Processes ONLY processing_log.csv rows with parsed_status == "pending"
-  AND where ocr_output/**/basename.txt exists (case-insensitive basename match).
-- Splits each document into context-aware table chunks:
-    [CONTEXT] ... (all narrative, with ALL other tables removed)
-    [CURRENT_TABLE] ... (exactly one table block, or a slice of it if very large)
-- No-table fallback: if a letter has no tables, the entire letter is promoted to CURRENT_TABLE.
-- Calls Azure GPT-4.1 per chunk; appends JSONL rows to data/parsed_results.csv.
-- Marks file "parsed" only if ALL chunks succeed; otherwise "failed".
-- Run controls: MAX_FILES, MAX_MINUTES, MAX_RETRIES.
+Overpayment Letter Parsing — Azure GPT-4.1 with robust BEGIN/END TABLE chunking.
 
-Adjust the Azure constants below if you're hard-coding.
+- Processes ONLY processing_log rows where parsed_status == "pending"
+  AND a matching OCR .txt exists (basename match to CSV `filename`).
+- Splits each letter into chunks: one per table, bounded by "BEGIN TABLE" ... "END TABLE".
+  * [CONTEXT]       narrative text with ALL tables removed (intro + between-table boilerplate)
+  * [CURRENT_TABLE] exactly ONE table's rows (BEGIN/END lines removed)
+- If a table is very large, we split it by size to avoid output caps.
+- If NO tables exist, the whole letter is treated as CURRENT_TABLE (split by size if needed).
+- On success: set parsed_status="parsed". If any chunk fails or time budget exceeded: "failed".
 """
 
 import csv
@@ -22,11 +20,11 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import List, Tuple, Iterable
+from typing import List, Tuple, Iterable, Optional
 from openai import AzureOpenAI
 
 # ======================
-# Paths / Config
+# CONFIG
 # ======================
 OCR_OUTPUT_DIR = Path("ocr_output")
 SYSTEM_MESSAGE_FILE = Path("prompts/system_message.txt")
@@ -34,8 +32,8 @@ PARSED_RESULTS_CSV = Path("data/parsed_results.csv")
 PROCESSING_LOG_CSV = Path("data/processing_log.csv")
 
 # Processing log fields
-LOG_FILENAME_COL = "filename"      # e.g., "image19857.pdf"
-LOG_STATUS_COL = "parsed_status"   # values: "pending" | "parsed" | "failed"
+LOG_FILENAME_COL = "filename"      # e.g., image19857.pdf
+LOG_STATUS_COL = "parsed_status"   # "pending" | "parsed" | "failed"
 STATUS_PENDING = "pending"
 STATUS_PARSED = "parsed"
 STATUS_FAILED = "failed"
@@ -43,9 +41,9 @@ STATUS_FAILED = "failed"
 # Batch / run control
 MAX_FILES = 10        # None for no limit
 MAX_MINUTES = 10      # None for no time limit
-MAX_RETRIES = 2       # GPT call retries on failure (per-chunk)
+MAX_RETRIES = 2       # per-chunk GPT retries with simple backoff
 
-# Output CSV columns (model fields + enrichments)
+# Output schema + enrichments
 OUTPUT_FIELDS = [
     "patient_name",
     "patient_id",
@@ -60,22 +58,25 @@ OUTPUT_FIELDS = [
     "remit_due_date",
     "parsing_notes",
     "no_records",
-    "filename",   # original PDF name from processing log
-    "payor",      # derived from OCR_OUTPUT_DIR/<PAYOR>/...
+    "filename",  # original PDF name
+    "payor",     # derived from ocr_output/<PAYOR>/...
 ]
 
-# ======================
-# Chunking controls
-# ======================
-# Primary sentinel(s) from your OCR pipeline. You said "BEING_TABLE"; include "BEGIN_TABLE" defensively.
-TABLE_SENTINEL_PATTERN = re.compile(r"(?im)^\s*(?:BEING_TABLE|BEGIN_TABLE)\b.*$")
+# ===== Table sentinel configuration =====
+# EXACT sentinels are "BEGIN TABLE" and "END TABLE" (case-insensitive).
+START_PAT = re.compile(r"(?im)^\s*BEGIN\s+TABLE\s*$")
+END_PAT   = re.compile(r"(?im)^\s*END\s+TABLE\s*$")
 
-# Size limits (fallback or giant tables). Roughly ~4 chars/token; 12k chars ~3k tokens.
+# Size limits (~4 chars/token; 12k chars ≈ 3k tokens)
 MAX_CHARS_PER_CHUNK = 12000
 CHUNK_OVERLAP_CHARS = 800
 
+# ===== Debugging aid =====
+DEBUG_DUMP_CHUNKS = False
+DEBUG_DIR = Path("debug_chunks")  # will contain <pdfname>__chunkNN.txt
+
 # ======================
-# Azure OpenAI (hard-code or swap to env/ dotenv later)
+# Azure OpenAI (hard-code for now)
 # ======================
 AZURE_OPENAI_ENDPOINT = "https://my-overpayment-parser.openai.azure.com/"
 AZURE_OPENAI_API_KEY = "YOUR_KEY_HERE"
@@ -101,7 +102,6 @@ def load_system_message(path: Path) -> str:
     return read_text(path).strip()
 
 def derive_payor(ocr_root: Path, file_path: Path) -> str:
-    """First subfolder under OCR_OUTPUT_DIR is treated as payor."""
     try:
         rel = file_path.resolve().relative_to(ocr_root.resolve())
         return rel.parts[0] if len(rel.parts) > 1 else ""
@@ -109,7 +109,6 @@ def derive_payor(ocr_root: Path, file_path: Path) -> str:
         return ""
 
 def sanitize_jsonl(raw: str) -> Iterable[str]:
-    """Keep only lines that look like JSON objects; strip code fences / trailing commas."""
     for line in raw.splitlines():
         s = line.strip().strip("`").strip()
         if not s:
@@ -154,109 +153,117 @@ def call_gpt_with_retries(client: AzureOpenAI, system_msg: str, user_text: str) 
             last_err = e
             print(f"[retry {attempt}/{MAX_RETRIES}] GPT call failed: {e}")
             if attempt < MAX_RETRIES:
-                time.sleep(2 * attempt)  # simple backoff
+                time.sleep(2 * attempt)
     raise last_err if last_err else RuntimeError("Unknown GPT error")
 
 # ======================
-# Chunk building (context + single table)
+# Table detection & chunking
 # ======================
+def _line_indices(pattern: re.Pattern, text: str) -> List[int]:
+    return [m.start() for m in pattern.finditer(text)]
+
+def _strip_lines(pattern: re.Pattern, text: str) -> str:
+    """Remove all lines that match a pattern (to strip BEGIN/END markers)."""
+    keep = []
+    for line in text.splitlines(keepends=True):
+        if not pattern.match(line):
+            keep.append(line)
+    return "".join(keep)
+
 def locate_table_blocks(text: str) -> List[Tuple[int, int]]:
     """
-    Return list of (start_idx, end_idx) for each table block.
-    A table starts at a TABLE_SENTINEL line and ends at the next sentinel or EOF.
+    Return [(start,end)] for each table: from BEGIN TABLE line to END TABLE line.
+    If a BEGIN has no END after it, we terminate at EOF.
+    If an END appears before any BEGIN (weird OCR), we ignore it.
     """
-    starts = [m.start() for m in TABLE_SENTINEL_PATTERN.finditer(text)]
+    starts = _line_indices(START_PAT, text)
+    ends = _line_indices(END_PAT, text)
     if not starts:
         return []
+
     blocks: List[Tuple[int, int]] = []
-    for i, s in enumerate(starts):
-        e = starts[i+1] if i+1 < len(starts) else len(text)
+    e_idx = 0
+    for s in starts:
+        # advance e_idx to the first END >= s
+        while e_idx < len(ends) and ends[e_idx] < s:
+            e_idx += 1
+        if e_idx < len(ends):
+            e = ends[e_idx]
+            e_idx += 1
+        else:
+            e = len(text)
         blocks.append((s, e))
     return blocks
 
-def strip_blocks(text: str, blocks: List[Tuple[int, int]], up_to: int = None, after: Tuple[int, int] = None) -> str:
+def strip_blocks(text: str, blocks: List[Tuple[int, int]], end_limit: Optional[int] = None) -> str:
     """
-    Remove specified table blocks from a slice of text.
-    - If up_to is set, keep only text from [0:up_to], then strip any table blocks fully within that slice.
-    - If after is set to (s,e), you can pass a slice after that block (e:next_start) and strip tables within it.
+    Remove all table blocks from text (optionally up to end_limit).
+    Produces narrative-only text for [CONTEXT].
     """
-    if up_to is not None:
-        slice_text = text[:up_to]
-        slice_blocks = [(s, e) for (s, e) in blocks if e <= up_to]
-    elif after is not None:
-        s0, e0 = after
-        # determine next start to bound the slice
-        # caller is expected to slice text[e0:next_start]
-        slice_text = text
-        slice_blocks = []  # we assume caller pre-sliced to not include complete tables
-    else:
-        slice_text = text
-        slice_blocks = blocks
-
-    if not slice_blocks:
-        return slice_text
-
     out = []
     pos = 0
-    for s, e in slice_blocks:
+    limit = len(text) if end_limit is None else min(end_limit, len(text))
+    for s, e in blocks:
+        if s >= limit:
+            break
         if pos < s:
-            out.append(slice_text[pos:s])
-        pos = e
-    if pos < len(slice_text):
-        out.append(slice_text[pos:])
+            out.append(text[pos:s])   # keep narrative before table
+        pos = max(pos, min(e, limit)) # skip table region
+    if pos < limit:
+        out.append(text[pos:limit])
     return "".join(out)
 
-def split_block_by_size(text: str, start: int, end: int) -> List[Tuple[int, int]]:
-    """Split a big block [start:end] into size-bounded windows with overlap."""
+def split_range_by_size(start: int, end: int) -> List[Tuple[int, int]]:
     ranges: List[Tuple[int, int]] = []
     n = end - start
-    offset = 0
-    while offset < n:
-        e = min(offset + MAX_CHARS_PER_CHUNK, n)
-        ranges.append((start + offset, start + e))
+    off = 0
+    while off < n:
+        e = min(off + MAX_CHARS_PER_CHUNK, n)
+        ranges.append((start + off, start + e))
         if e >= n:
             break
-        offset = max(offset, e - CHUNK_OVERLAP_CHARS)
+        off = max(off, e - CHUNK_OVERLAP_CHARS)
     return ranges
 
-def build_contextual_chunks(text: str) -> List[str]:
+def build_chunks(text: str) -> List[str]:
     """
-    Yield chunks with:
-      [CONTEXT]    -> narrative only (all other tables removed)
-      [CURRENT_TABLE] -> exactly one table (or a size-slice of it)
-    No-table fallback: the entire letter goes to CURRENT_TABLE (may also be split by size).
+    Build chunks with:
+      [CONTEXT]       -> narrative only, all tables removed
+      [CURRENT_TABLE] -> exactly one table (BEGIN/END stripped), size-split if necessary
+    If no tables -> entire text promoted to CURRENT_TABLE (may be size-split).
     """
     blocks = locate_table_blocks(text)
 
-    # No tables: promote whole letter to CURRENT_TABLE (split by size if needed)
+    # No tables: promote whole letter into CURRENT_TABLE
     if not blocks:
-        # size-split the entire letter if necessary
-        whole_ranges = split_block_by_size(text, 0, len(text)) if len(text) > MAX_CHARS_PER_CHUNK else [(0, len(text))]
-        chunks: List[str] = []
-        for s, e in whole_ranges:
-            chunk = f"[CONTEXT]\n\n[CURRENT_TABLE]\n{text[s:e]}\n\n[END]"
-            chunks.append(chunk)
-        return chunks
+        ranges = split_range_by_size(0, len(text)) if len(text) > MAX_CHARS_PER_CHUNK else [(0, len(text))]
+        return [f"[CONTEXT]\n\n[CURRENT_TABLE]\n{text[s:e]}\n\n[END]" for s, e in ranges]
 
     chunks: List[str] = []
 
-    for idx, (s, e) in enumerate(blocks):
-        # CONTEXT for this table = (0 -> s) with all earlier tables stripped,
-        # plus after-table narrative (e -> next_start) with tables stripped (none fully in that slice).
-        pre_context = strip_blocks(text, blocks, up_to=s)
-        next_start = blocks[idx + 1][0] if (idx + 1) < len(blocks) else len(text)
-        after_slice = text[e:next_start]
-        # after_slice shouldn't contain full tables by construction, so no need to strip again
-        context = (pre_context + "\n" + after_slice).strip()
+    for i, (s, e) in enumerate(blocks):
+        next_start = blocks[i+1][0] if i + 1 < len(blocks) else len(text)
 
-        # CURRENT_TABLE = this table block (may need size-splitting)
-        table_ranges = [(s, e)]
+        # CONTEXT = narrative text before this table (tables removed) + narrative after table up to next table
+        pre_context = strip_blocks(text, blocks, end_limit=s)
+        after_context = text[e:next_start]  # by construction contains no complete tables
+        context = (pre_context + "\n" + after_context).strip()
+
+        # Table content slice; remove BEGIN/END marker lines
+        table_slice = text[s:e]
+        table_slice = _strip_lines(START_PAT, table_slice)
+        table_slice = _strip_lines(END_PAT, table_slice)
+
+        # Split large table slices
         if (e - s) > MAX_CHARS_PER_CHUNK:
-            table_ranges = split_block_by_size(text, s, e)
-
-        for ts, te in table_ranges:
-            chunk = f"[CONTEXT]\n{context}\n\n[CURRENT_TABLE]\n{text[ts:te]}\n\n[END]"
-            chunks.append(chunk)
+            ranges = split_range_by_size(s, e)
+            for rs, re_ in ranges:
+                part = text[rs:re_]
+                part = _strip_lines(START_PAT, part)
+                part = _strip_lines(END_PAT, part)
+                chunks.append(f"[CONTEXT]\n{context}\n\n[CURRENT_TABLE]\n{part}\n\n[END]")
+        else:
+            chunks.append(f"[CONTEXT]\n{context}\n\n[CURRENT_TABLE]\n{table_slice}\n\n[END]")
 
     return chunks
 
@@ -276,23 +283,22 @@ def main():
             raise ValueError(f"Processing log must have columns: {LOG_FILENAME_COL}, {LOG_STATUS_COL}")
         log_rows = list(reader)
 
-    # Build map of OCR .txt files by stem (case-insensitive)
-    txt_files_map = {p.stem.lower(): p for p in OCR_OUTPUT_DIR.rglob("*.txt")}
+    # Map of OCR .txt files by basename (case-insensitive)
+    txt_files = {p.stem.lower(): p for p in OCR_OUTPUT_DIR.rglob("*.txt")}
 
-    # Worklist: rows pending + with a matching .txt
+    # Build worklist
     work_indices = []
     for i, r in enumerate(log_rows):
         if str(r.get(LOG_STATUS_COL, "")).strip().lower() != STATUS_PENDING:
             continue
         base = Path(r.get(LOG_FILENAME_COL, "")).stem.lower()
-        if base and base in txt_files_map:
+        if base and base in txt_files:
             work_indices.append(i)
 
     if not work_indices:
         print("No pending files found with matching OCR .txt files.")
         return
 
-    # Apply MAX_FILES
     if MAX_FILES is not None:
         work_indices = work_indices[:MAX_FILES]
 
@@ -310,7 +316,7 @@ def main():
 
         row = log_rows[idx]
         base = Path(row[LOG_FILENAME_COL]).stem.lower()
-        txt_path = txt_files_map.get(base)
+        txt_path = txt_files.get(base)
         if not txt_path:
             row[LOG_STATUS_COL] = STATUS_FAILED
             print(f"[failed] {row[LOG_FILENAME_COL]} (missing OCR .txt)")
@@ -320,9 +326,13 @@ def main():
 
         try:
             ocr_text = read_text(txt_path)
-            parts = build_contextual_chunks(ocr_text)
-            if len(parts) > 1:
-                print(f"[chunking] {row[LOG_FILENAME_COL]} -> {len(parts)} chunk(s)")
+            parts = build_chunks(ocr_text)
+            print(f"[chunking] {row[LOG_FILENAME_COL]} -> {len(parts)} chunk(s)")
+
+            if DEBUG_DUMP_CHUNKS:
+                DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+                for n, c in enumerate(parts, 1):
+                    (DEBUG_DIR / f"{Path(row[LOG_FILENAME_COL]).stem}__chunk{n:02d}.txt").write_text(c, encoding="utf-8")
 
             file_failed = False
             file_rows = 0
@@ -342,7 +352,7 @@ def main():
                         except json.JSONDecodeError:
                             continue
                         rec = {k: obj.get(k, None) for k in OUTPUT_FIELDS if k not in ("filename", "payor")}
-                        rec["filename"] = row[LOG_FILENAME_COL]  # original PDF name from log
+                        rec["filename"] = row[LOG_FILENAME_COL]
                         rec["payor"] = payor
                         out_rows.append(rec)
 
@@ -367,7 +377,7 @@ def main():
             row[LOG_STATUS_COL] = STATUS_FAILED
             print(f"[failed] {row.get(LOG_FILENAME_COL, '<unknown>')} — {type(e).__name__}")
 
-    # Rewrite the processing log with updated statuses
+    # Rewrite processing log
     PROCESSING_LOG_CSV.parent.mkdir(parents=True, exist_ok=True)
     with PROCESSING_LOG_CSV.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
